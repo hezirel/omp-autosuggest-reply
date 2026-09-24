@@ -1984,6 +1984,7 @@ function makeFake(opts: {
 	> = [];
 	let unsubInputCalls = 0;
 	let widgetContent: string[] | undefined;
+	let statusBadge: string | undefined;
 	let editorComponentInstalled = false;
 	let editorComponentCalls = 0;
 	let editorComponentRestores = 0;
@@ -2077,13 +2078,16 @@ function makeFake(opts: {
 			setEditorText: (text: string) => {
 				editorText = text;
 			},
-			setWidget: (
-				_key: string,
-				content: string[] | undefined,
-				_options?: { placement?: string },
-			) => {
-				widgetContent = content;
-			},
+		setWidget: (
+			_key: string,
+			content: string[] | undefined,
+			_options?: { placement?: string },
+		) => {
+			widgetContent = content;
+		},
+		setStatus: (key: string, text: string | undefined) => {
+			if (key === "next-prompt") statusBadge = text;
+		},
 			getEditorComponent: () => editorComponentOwner,
 			setEditorComponent: (
 				factory:
@@ -2148,6 +2152,9 @@ function makeFake(opts: {
 		ctx,
 		get widgetContent() {
 			return widgetContent;
+		},
+		get statusBadge() {
+			return statusBadge;
 		},
 		get editorText() {
 			return editorText;
@@ -5439,6 +5446,31 @@ describe("manual trigger (suggestKey + autoSuggest)", () => {
 		await fake.commands.get("autosuggest-reply")!.handler("suggest", fake.ctx);
 		expect(fake.calls.complete).toHaveLength(1);
 		expect(fake.widgetContent?.join("\n")).toContain("suggestion");
+	});
+
+	test("status badge renders mode: ↳ auto / ↳ manual / off", async () => {
+		writeFile(
+			tmpHome,
+			"next-prompt.json",
+			JSON.stringify({ enabled: true, autoSuggest: true }),
+		);
+		const auto = await setup({ branch: [assistantEntry("hi")] });
+		await auto.fake.handlers.get("session_start")!({}, auto.fake.ctx);
+		expect(auto.fake.statusBadge).toBe("↳ auto");
+
+		writeFile(
+			tmpHome,
+			"next-prompt.json",
+			JSON.stringify({ enabled: true, autoSuggest: false }),
+		);
+		const manual = await setup({ branch: [assistantEntry("hi")] });
+		await manual.fake.handlers.get("session_start")!({}, manual.fake.ctx);
+		expect(manual.fake.statusBadge).toBe("↳ manual");
+
+		await manual.fake.commands
+			.get("autosuggest-reply")!
+			.handler("off", manual.fake.ctx);
+		expect(manual.fake.statusBadge).toBeUndefined();
 	});
 
 	test("suggest key on a non-empty editor → no compute", async () => {

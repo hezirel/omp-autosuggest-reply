@@ -2483,8 +2483,15 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	// Status-line badge; best-effort (absent on hosts without setStatus).
 	function updateStatusBadge(ctx: HostCtx): void {
 		const on = ref.sessionEnabled && ref.active;
+		let text: string | undefined;
+		if (on) {
+			// Mode-aware badge: auto (settle-computed) vs manual (suggestKey /
+			// `/autosuggest-reply suggest` only — zero background quota).
+			const auto = (effective?.autoSuggest ?? DEFAULT_AUTO_SUGGEST) !== false;
+			text = auto ? "↳ auto" : "↳ manual";
+		}
 		try {
-			ctx.ui.setStatus?.("next-prompt", on ? "↳ suggest" : undefined);
+			ctx.ui.setStatus?.("next-prompt", text);
 		} catch {
 			// The status bar is decorative; ignore failures.
 		}
@@ -2607,10 +2614,11 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			if (!ref.state || !effective) return;
 			// Re-read config so a mid-session edit takes effect on the next
 			// settle/end without a reload.
-			effective = loadEffectiveConfig(ctx.cwd, {
-				projectTrusted: projectTrustedForHost(ctx),
-			});
-			if (effective.computeDisabled) return;
+		effective = loadEffectiveConfig(ctx.cwd, {
+			projectTrusted: projectTrustedForHost(ctx),
+		});
+		updateStatusBadge(ctx);
+		if (effective.computeDisabled) return;
 			if (!ref.sessionEnabled) return;
 			// Manual-only mode: settled turns never compute on their own; the
 			// user triggers via suggestKey or `/autosuggest-reply suggest`.
@@ -2657,10 +2665,11 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			if (!isInteractiveContext(ctx)) return;
 			if (!ref.state || !effective) return;
 			// Re-read config so a mid-session edit takes effect immediately.
-			effective = loadEffectiveConfig(ctx.cwd, {
-				projectTrusted: projectTrustedForHost(ctx),
-			});
-			if (effective.computeDisabled) return;
+		effective = loadEffectiveConfig(ctx.cwd, {
+			projectTrusted: projectTrustedForHost(ctx),
+		});
+		updateStatusBadge(ctx);
+		if (effective.computeDisabled) return;
 			if (!ref.sessionEnabled) {
 				ctx.ui.notify(
 					"next-prompt: suggestions OFF for this session — /autosuggest-reply on to enable",
