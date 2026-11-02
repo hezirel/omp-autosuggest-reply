@@ -1886,13 +1886,16 @@ function makeInputHandler(
 
 		// Carousel: left/right (or Alt+< / Alt+>) while a suggestion is showing
 		// on an empty editor. Wrap within this turn's batch. No extra model call.
+		// Ctrl+P = reverse only (fork patch); elsewhere it stays autocomplete-up.
+		const isCtrlP =
+			data === "\x10" || matchesKey(data, "ctrl+p" as KeyId);
 		if (
 			state.suggestion &&
 			state.isIdleGetter() &&
 			editorTextBefore.length === 0 &&
-			(isLeftArrow(data) || isRightArrow(data))
+			(isLeftArrow(data) || isRightArrow(data) || isCtrlP)
 		) {
-			if (isLeftArrow(data)) cyclePrevious(state);
+			if (isLeftArrow(data) || isCtrlP) cyclePrevious(state);
 			else cycleNext(state);
 			return { consume: true };
 		}
