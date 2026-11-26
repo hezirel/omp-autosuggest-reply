@@ -40,7 +40,9 @@ import {
 	detectHost,
 	formatModelOption,
 	formatSuggestionHint,
-	GhostEditor,
+	GhostEditor as GhostEditorExport,
+	type GhostEditorClass,
+	type GhostEditorInstance,
 	humanizeKey,
 	isInteractiveContext,
 	isLeftArrow,
@@ -73,6 +75,22 @@ import {
 	type SuggestionCtx,
 	type SuggestionState,
 } from "./next-prompt.ts";
+
+// `GhostEditor` is built lazily from the host's `CustomEditor` and is undefined
+// on hosts without one (OMP >= 19.2). These tests run against Pi's packages,
+// where the class exists; the instance type is widened to the real editor
+// surface the tests drive.
+type GhostEditor = GhostEditorInstance & {
+	focused: boolean;
+	setText(text: string): void;
+	getText(): string;
+};
+if (!GhostEditorExport) {
+	throw new Error("GhostEditor is unavailable: the test host exports no CustomEditor");
+}
+const GhostEditor = GhostEditorExport as unknown as new (
+	...args: ConstructorParameters<GhostEditorClass>
+) => GhostEditor;
 
 // ---------------------------------------------------------------------------
 // Helpers

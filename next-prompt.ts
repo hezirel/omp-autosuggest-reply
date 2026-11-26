@@ -11,10 +11,13 @@
  *   - "widget": a colored below-editor line `↳ next: <suggestion>  (Enter · 1/3 ←→)`.
  *   - "ghost":  inline greyed ghost text in the input box after the caret.
  *   - "both":   inline ghost AND the below-editor line.
- * All three modes run on Pi and OMP. OMP has no editor-owner getter, so a ghost
- * failure there restores the default editor (Pi restores the captured prior
- * owner), and another custom-editor extension installed first in the same OMP
- * session is not detected (last installer wins).
+ * "widget" runs on every host. "ghost"/"both" need the legacy custom-editor
+ * API (`ctx.ui.setEditorComponent` + `CustomEditor`), which Pi and OMP < 19.2
+ * provide; on OMP >= 19.2 (reactive pi-tui, composer hooks) they fall back to
+ * widget with one warning per session. OMP has no editor-owner getter, so a
+ * ghost failure there restores the default editor (Pi restores the captured
+ * prior owner), and another custom-editor extension installed first in the
+ * same OMP session is not detected (last installer wins).
  *
  * The accept key (default `enter`, configurable) is handled via a GLOBAL
  * `ctx.ui.onTerminalInput` listener that swallows the key and fills the editor
@@ -49,6 +52,10 @@
  *     auth resolver;
  *   - editor ownership: Pi can capture/restore `getEditorComponent()`; OMP has
  *     no such API, hence the widget-only downgrade;
+ *   - UI imports: the module never imports upstream pi-tui (OMP >= 19.2 rejects
+ *     it at load): key matching and ANSI width math are local, and
+ *     `CustomEditor` is read at runtime from the coding-agent namespace only
+ *     when the host still has `setEditorComponent`;
  *   - project trust: Pi gates project config on `isProjectTrusted()`; OMP has
  *     no project-trust API and follows the configuration loader default.
  *
@@ -69,21 +76,15 @@ import { dirname, join } from "node:path";
 
 import {
 	CONFIG_DIR_NAME,
-	CustomEditor,
 	getAgentDir,
 	type ExtensionAPI,
 	type ExtensionContext,
 	type KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
-import {
-	matchesKey,
-	CURSOR_MARKER,
-	truncateToWidth,
-	visibleWidth,
-	type EditorTheme,
-	type KeyId,
-	type TUI,
-} from "@earendil-works/pi-tui";
+// Namespace view of the same module, read at runtime ONLY for the optional
+// `CustomEditor` export (ghost mode). A named import would fail to link on
+// OMP >= 19.2, whose coding-agent root no longer exports it.
+import * as hostCodingAgent from "@earendil-works/pi-coding-agent";
 import type {
 	Api,
 	AssistantMessage,
@@ -129,7 +130,7 @@ export interface NextPromptConfig {
 	model?: NextPromptModelConfig;
 	/** Reasoning/thinking level for the suggestion model ("minimal".."max"). */
 	thinking?: ThinkingLevel;
-	/** Key id that accepts the suggestion (any pi-tui KeyId). Defaults to "enter". */
+	/** Key id that accepts the suggestion (see `matchesKeyId` for the supported set). Defaults to "enter". */
 	acceptKey?: string;
 	/** How the suggestion is shown. "widget" (default) = below-editor line; "ghost" = inline overlay in the input box. */
 	renderMode?: RenderMode;
@@ -159,7 +160,7 @@ export interface NextPromptConfig {
 	 */
 	enhanceEnabled?: boolean;
 	/**
-	 * Key id (any pi-tui KeyId) that enhances the current editor text. Defaults
+	 * Key id (see `matchesKeyId`) that enhances the current editor text. Defaults
 	 * to "ctrl+up". Must differ from `acceptKey`; "enter"/"tab" are rejected.
 	 */
 	enhanceKey?: string;
@@ -172,7 +173,7 @@ export interface NextPromptConfig {
 	 */
 	autoSuggest?: boolean;
 	/**
-	 * Key id (any pi-tui KeyId) that manually triggers suggestion compute on
+	 * Key id (see `matchesKeyId`) that manually triggers suggestion compute on
 	 * an empty editor. Defaults to "ctrl+down". Fires only while idle with an
 	 * empty editor; "enter"/"tab" are rejected (submit/autocomplete conflicts).
 	 */
@@ -276,7 +277,7 @@ const ACCENT = "\x1b[36m";
 const DIM = "\x1b[2m";
 const RESET = "\x1b[0m";
 
-/** Humanize a KeyId for display, e.g. "ctrl+tab" → "Ctrl-Tab". */
+/** Humanize a key id for display, e.g. "ctrl+tab" → "Ctrl-Tab". */
 export function humanizeKey(key: string): string {
 	return key
 		.split("+")
@@ -310,10 +311,11 @@ export function isRightArrow(data: string): boolean {
 }
 
 /**
- * Raw-byte fallback for accept-key detection, covering the LEGACY escape forms
- * that pi-tui's matchesKey() does not recognize on its own. Modern CSI-u (kitty)
- * and xterm modifyOtherKeys encodings are matched by matchesKey(); this only
- * adds the pre-protocol forms:
+ * Raw-byte fallback for accept-key detection, covering a few LEGACY escape
+ * forms beyond what {@link matchesKeyId} decodes (notably the SS3 "\x1bO<char>"
+ * alt variant and uppercase ESC+char for alt+<letter>). Kitty CSI-u and xterm
+ * modifyOtherKeys encodings are handled by matchesKeyId(); this only adds the
+ * pre-protocol forms:
  *   enter      → "\r" / "\n"
  *   alt+<char> → "\x1b<char>" (or SS3 "\x1bO<char>")
  *   ctrl+space → "\x00"
@@ -322,7 +324,7 @@ export function isRightArrow(data: string): boolean {
  *
  * NOTE: a shift-bearing symbol keyid (e.g. "alt+?") cannot match under the
  * enhanced keyboard protocols — the terminal reports modifier shift|alt while
- * the keyid carries only alt, and matchesKey() requires exact modifier
+ * the keyid carries only alt, and matchesKeyId() requires exact modifier
  * equality. Keep DEFAULT_ENHANCE_KEY on a non-shift key such as "ctrl+up".
  */
 export function matchesAcceptKeyRaw(data: string, acceptKey: string): boolean {
@@ -364,6 +366,352 @@ export function matchesAcceptKeyRaw(data: string, acceptKey: string): boolean {
  */
 export function isKittyKeyRelease(data: string): boolean {
 	return /^\x1b\[[\d:;]*:3[u~ABCDHF]$/.test(data);
+}
+
+// ---------------------------------------------------------------------------
+// Key-id matching (local replacement for upstream pi-tui's matchesKey)
+// ---------------------------------------------------------------------------
+//
+// Supported key ids (case-insensitive, `+`-joined, modifiers in any order):
+//   modifiers: shift, alt, ctrl, super
+//   named:     enter (alias return), escape (alias esc), tab, space, backspace,
+//              delete, insert, home, end, pageup, pagedown, up, down, left,
+//              right, f1..f12
+//   character: any single character (a-z, 0-9, symbols such as "/" or "?";
+//              "ctrl++" names the plus key)
+// Encodings decoded: legacy bytes (CR/LF/TAB/DEL/BS/NUL, C0 control chars for
+// ctrl+<letter|[\]^_->, ESC-prefixed alt forms, uppercase = shift+letter),
+// xterm CSI/SS3 cursor + tilde keys with `;<mod>` parameters, rxvt shift/ctrl
+// arrow and tilde variants, kitty CSI-u (with alternate keys, event types and
+// keypad codepoints; non-Latin layouts fall back to the reported base-layout
+// key) and xterm modifyOtherKeys (`CSI 27;<mod>;<code>~`). Modifiers must
+// match exactly (Caps/Num Lock ignored); key-release events never match.
+
+/** Modifier bits as reported by kitty / xterm (the wire value is bits + 1). */
+const MOD_SHIFT = 1;
+const MOD_ALT = 2;
+const MOD_CTRL = 4;
+const MOD_SUPER = 8;
+/** Caps Lock + Num Lock: reported by kitty, never part of a key id. */
+const MOD_LOCK_MASK = 64 | 128;
+
+/** One decoded keypress (or key id): canonical key name or single character, plus modifier bits. */
+export interface DecodedKey {
+	key: string;
+	mod: number;
+}
+
+/** Key-id names → canonical names. */
+const NAMED_KEYS: ReadonlyMap<string, string> = new Map<string, string>([
+	["enter", "enter"],
+	["return", "enter"],
+	["escape", "escape"],
+	["esc", "escape"],
+	["tab", "tab"],
+	["space", "space"],
+	["backspace", "backspace"],
+	["delete", "delete"],
+	["insert", "insert"],
+	["home", "home"],
+	["end", "end"],
+	["pageup", "pageup"],
+	["pagedown", "pagedown"],
+	["up", "up"],
+	["down", "down"],
+	["left", "left"],
+	["right", "right"],
+	...Array.from({ length: 12 }, (_, i): [string, string] => [`f${i + 1}`, `f${i + 1}`]),
+]);
+
+/** Kitty keypad / functional private-use codepoints → canonical key. */
+const KITTY_KEYPAD_KEYS: ReadonlyMap<number, string> = new Map<number, string>([
+	[57399, "0"],
+	[57400, "1"],
+	[57401, "2"],
+	[57402, "3"],
+	[57403, "4"],
+	[57404, "5"],
+	[57405, "6"],
+	[57406, "7"],
+	[57407, "8"],
+	[57408, "9"],
+	[57409, "."],
+	[57410, "/"],
+	[57411, "*"],
+	[57412, "-"],
+	[57413, "+"],
+	[57414, "enter"],
+	[57415, "="],
+	[57416, ","],
+	[57417, "left"],
+	[57418, "right"],
+	[57419, "up"],
+	[57420, "down"],
+	[57421, "pageup"],
+	[57422, "pagedown"],
+	[57423, "home"],
+	[57424, "end"],
+	[57425, "insert"],
+	[57426, "delete"],
+]);
+
+/** `CSI <n> ~` (and rxvt `CSI <n> $` / `^`) key numbers. */
+const TILDE_KEYS: Readonly<Record<string, string>> = {
+	"1": "home",
+	"2": "insert",
+	"3": "delete",
+	"4": "end",
+	"5": "pageup",
+	"6": "pagedown",
+	"7": "home",
+	"8": "end",
+	"11": "f1",
+	"12": "f2",
+	"13": "f3",
+	"14": "f4",
+	"15": "f5",
+	"17": "f6",
+	"18": "f7",
+	"19": "f8",
+	"20": "f9",
+	"21": "f10",
+	"23": "f11",
+	"24": "f12",
+};
+
+/** Final byte of `CSI [1;<mod>] X` / `SS3 X` → key. */
+const CURSOR_FINAL_KEYS: Readonly<Record<string, string>> = {
+	A: "up",
+	B: "down",
+	C: "right",
+	D: "left",
+	H: "home",
+	F: "end",
+	P: "f1",
+	Q: "f2",
+	R: "f3",
+	S: "f4",
+};
+
+/** rxvt lowercase finals: `CSI a..d` = shift+arrow, `SS3 a..d` = ctrl+arrow. */
+const RXVT_ARROW_KEYS: Readonly<Record<string, string>> = {
+	a: "up",
+	b: "down",
+	c: "right",
+	d: "left",
+};
+
+/** ESC + letter that some terminals send for Option/Alt+arrow (readline motions). */
+const ALT_MOTION_KEYS: Readonly<Record<string, string>> = {
+	b: "left",
+	f: "right",
+	p: "up",
+	n: "down",
+};
+
+/** Wire modifier parameter (1-based, may be empty) → modifier bits, locks dropped. */
+function wireModifier(param: string | undefined): number {
+	const n = param ? Number.parseInt(param, 10) : 1;
+	return (Number.isFinite(n) && n > 0 ? n - 1 : 0) & ~MOD_LOCK_MASK;
+}
+
+/** Kitty / modifyOtherKeys codepoint → canonical key, or undefined when unsupported. */
+function keyFromCodepoint(cp: number): string | undefined {
+	const keypad = KITTY_KEYPAD_KEYS.get(cp);
+	if (keypad) return keypad;
+	switch (cp) {
+		case 13:
+			return "enter";
+		case 9:
+			return "tab";
+		case 27:
+			return "escape";
+		case 8:
+		case 127:
+			return "backspace";
+		case 32:
+			return "space";
+	}
+	if (cp < 32 || (cp >= 0x80 && cp < 0xa0) || cp > 0x10ffff) return undefined;
+	// Remaining kitty functional keys (F13+, media, modifiers) live in the PUA.
+	if (cp >= 0xe000 && cp <= 0xf8ff) return undefined;
+	return String.fromCodePoint(cp).toLowerCase();
+}
+
+/** Decode one legacy code point (no ESC prefix) into its possible key ids. */
+function decodeLegacyChar(ch: string): DecodedKey[] {
+	switch (ch) {
+		case "\r":
+			return [{ key: "enter", mod: 0 }, { key: "m", mod: MOD_CTRL }];
+		case "\n":
+			return [{ key: "enter", mod: 0 }, { key: "j", mod: MOD_CTRL }];
+		case "\t":
+			return [{ key: "tab", mod: 0 }, { key: "i", mod: MOD_CTRL }];
+		case "\x1b":
+			return [{ key: "escape", mod: 0 }, { key: "[", mod: MOD_CTRL }];
+		case "\x7f":
+			return [{ key: "backspace", mod: 0 }];
+		case "\x08":
+			// Ambiguous: plain Backspace on some terminals, Ctrl+Backspace on
+			// Windows Terminal, and Ctrl+H everywhere.
+			return [
+				{ key: "backspace", mod: 0 },
+				{ key: "backspace", mod: MOD_CTRL },
+				{ key: "h", mod: MOD_CTRL },
+			];
+		case "\x00":
+			return [{ key: "space", mod: MOD_CTRL }, { key: "@", mod: MOD_CTRL }];
+		case " ":
+			return [{ key: "space", mod: 0 }];
+		case "\x1c":
+			return [{ key: "\\", mod: MOD_CTRL }];
+		case "\x1d":
+			return [{ key: "]", mod: MOD_CTRL }];
+		case "\x1e":
+			return [{ key: "^", mod: MOD_CTRL }];
+		case "\x1f":
+			return [{ key: "_", mod: MOD_CTRL }, { key: "-", mod: MOD_CTRL }];
+	}
+	const cp = ch.codePointAt(0) ?? 0;
+	if (cp >= 1 && cp <= 26) return [{ key: String.fromCharCode(cp + 96), mod: MOD_CTRL }];
+	if (cp < 32 || cp === 127 || (cp >= 0x80 && cp < 0xa0)) return [];
+	const lower = ch.toLowerCase();
+	// Legacy shift+letter arrives as the uppercase character.
+	return [{ key: lower, mod: lower !== ch ? MOD_SHIFT : 0 }];
+}
+
+/**
+ * Decode raw terminal input into the key ids it may represent (legacy bytes
+ * are ambiguous, hence a list). Key releases and bracketed pastes decode to
+ * nothing.
+ */
+export function decodeKeyInput(data: string): DecodedKey[] {
+	if (!data || data.startsWith("\x1b[200~")) return [];
+	let m: RegExpMatchArray | null;
+
+	// Kitty CSI-u: CSI code[:shifted[:base]] [; mod[:event] [; text]] u
+	m = data.match(/^\x1b\[(\d+)(?::(\d*))?(?::(\d+))?(?:;(\d*)(?::(\d+))?)?(?:;[\d:]*)?u$/);
+	if (m) {
+		if (m[5] === "3") return [];
+		const mod = wireModifier(m[4]);
+		const out: DecodedKey[] = [];
+		const primary = keyFromCodepoint(Number.parseInt(m[1]!, 10));
+		if (primary) out.push({ key: primary, mod });
+		// Non-Latin layouts: also accept the base (US-layout) key, but only when
+		// the primary is not already an ASCII key (remapped Latin layouts stay
+		// authoritative).
+		if (m[3] && (!primary || primary.length !== 1 || primary.charCodeAt(0) > 0x7e)) {
+			const base = keyFromCodepoint(Number.parseInt(m[3], 10));
+			if (base && base !== primary) out.push({ key: base, mod });
+		}
+		return out;
+	}
+
+	// xterm modifyOtherKeys: CSI 27 ; mod ; code ~
+	m = data.match(/^\x1b\[27;(\d+);(\d+)~$/);
+	if (m) {
+		const key = keyFromCodepoint(Number.parseInt(m[2]!, 10));
+		return key ? [{ key, mod: wireModifier(m[1]) }] : [];
+	}
+
+	// Cursor / F1-F4 / home / end: CSI [1 ; mod[:event]] X
+	m = data.match(/^\x1b\[(?:1;(\d*)(?::(\d+))?)?([ABCDFHPQRS])$/);
+	if (m) {
+		if (m[2] === "3") return [];
+		return [{ key: CURSOR_FINAL_KEYS[m[3]!]!, mod: wireModifier(m[1]) }];
+	}
+
+	// Tilde keys: CSI n [; mod[:event]] ~
+	m = data.match(/^\x1b\[(\d+)(?:;(\d*)(?::(\d+))?)?~$/);
+	if (m) {
+		if (m[3] === "3") return [];
+		const key = TILDE_KEYS[m[1]!];
+		return key ? [{ key, mod: wireModifier(m[2]) }] : [];
+	}
+
+	// rxvt modified tilde keys: CSI n $ (shift) / CSI n ^ (ctrl)
+	m = data.match(/^\x1b\[(\d+)([$^])$/);
+	if (m) {
+		const key = TILDE_KEYS[m[1]!];
+		return key ? [{ key, mod: m[2] === "$" ? MOD_SHIFT : MOD_CTRL }] : [];
+	}
+
+	if (data === "\x1b[Z") return [{ key: "tab", mod: MOD_SHIFT }];
+
+	// rxvt shift+arrow: CSI a..d
+	m = data.match(/^\x1b\[([abcd])$/);
+	if (m) return [{ key: RXVT_ARROW_KEYS[m[1]!]!, mod: MOD_SHIFT }];
+
+	// Linux console F1-F5: CSI [ A..E
+	m = data.match(/^\x1b\[\[([A-E])$/);
+	if (m) return [{ key: `f${m[1]!.charCodeAt(0) - 64}`, mod: 0 }];
+
+	// SS3: unmodified cursor / F1-F4, keypad Enter, rxvt ctrl+arrow
+	m = data.match(/^\x1bO([ABCDFHPQRSMabcd])$/);
+	if (m) {
+		const f = m[1]!;
+		if (f === "M") return [{ key: "enter", mod: 0 }];
+		const rxvt = RXVT_ARROW_KEYS[f];
+		if (rxvt) return [{ key: rxvt, mod: MOD_CTRL }];
+		return [{ key: CURSOR_FINAL_KEYS[f]!, mod: 0 }];
+	}
+
+	const chars = Array.from(data);
+	if (chars.length === 1) return decodeLegacyChar(chars[0]!);
+
+	// Legacy alt: ESC + one code point (alt+<key>, ctrl+alt+<key>, alt+enter, …).
+	if (chars.length === 2 && chars[0] === "\x1b") {
+		const out = decodeLegacyChar(chars[1]!).map((k) => ({ key: k.key, mod: k.mod | MOD_ALT }));
+		// Terminals that map Option+arrows to readline word/line motions.
+		const motion = ALT_MOTION_KEYS[chars[1]!];
+		if (motion) out.push({ key: motion, mod: MOD_ALT });
+		return out;
+	}
+	return [];
+}
+
+/**
+ * Parse a config key id ("ctrl+down", "alt+/", "enter") into a key + modifier
+ * bits. Undefined for an empty id, an unknown modifier, or an unsupported key
+ * name (see the supported set above).
+ */
+export function parseKeyId(keyId: string): DecodedKey | undefined {
+	const id = keyId.trim().toLowerCase();
+	if (!id) return undefined;
+	let parts: string[];
+	if (id === "+") parts = ["+"];
+	else if (id.endsWith("++")) parts = [...id.slice(0, -2).split("+"), "+"];
+	else parts = id.split("+");
+	const keyPart = parts.pop();
+	if (!keyPart) return undefined;
+	let mod = 0;
+	for (const part of parts) {
+		if (part === "shift") mod |= MOD_SHIFT;
+		else if (part === "alt") mod |= MOD_ALT;
+		else if (part === "ctrl") mod |= MOD_CTRL;
+		else if (part === "super") mod |= MOD_SUPER;
+		else return undefined;
+	}
+	const named = NAMED_KEYS.get(keyPart);
+	if (named) return { key: named, mod };
+	if (Array.from(keyPart).length === 1) return { key: keyPart, mod };
+	return undefined;
+}
+
+/**
+ * Whether raw terminal input `data` is the key named by `keyId`. Host-neutral
+ * replacement for upstream pi-tui's `matchesKey` (which OMP >= 19.2 no longer
+ * lets extensions import). Exact modifier equality; releases never match.
+ */
+export function matchesKeyId(data: string, keyId: string): boolean {
+	const want = parseKeyId(keyId);
+	if (!want) return false;
+	return decodeKeyInput(data).some((k) => k.key === want.key && k.mod === want.mod);
+}
+
+/** Configured-key check used by the input handler: protocol decode, then the legacy byte fallback. */
+export function matchesConfiguredKey(data: string, keyId: string): boolean {
+	return matchesKeyId(data, keyId) || matchesAcceptKeyRaw(data, keyId);
 }
 
 export function loadConfig(
@@ -1285,6 +1633,157 @@ export function shouldTrigger(
 }
 
 // ---------------------------------------------------------------------------
+// Terminal width helpers (local replacements for upstream pi-tui's
+// visibleWidth / truncateToWidth; OMP >= 19.2 rejects pi-tui imports)
+// ---------------------------------------------------------------------------
+
+/**
+ * Zero-width APC marker the legacy pi-tui editor emits at the caret (same
+ * bytes on Pi and OMP < 19.2). Only the ghost overlay reads it.
+ */
+export const CURSOR_MARKER = "\x1b_pi:c\x07";
+
+const graphemeSegmenter: Intl.Segmenter | undefined =
+	typeof Intl !== "undefined" && typeof Intl.Segmenter === "function"
+		? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+		: undefined;
+
+function segmentGraphemes(text: string): string[] {
+	if (!graphemeSegmenter) return Array.from(text);
+	return Array.from(graphemeSegmenter.segment(text), (s) => s.segment);
+}
+
+/**
+ * Length of the escape sequence starting at `s[i]` (0 when `s[i]` is not ESC):
+ * CSI (`ESC [ … final`), OSC / APC / DCS / PM / SOS (terminated by BEL or
+ * `ESC \`), otherwise ESC plus one byte.
+ */
+function escapeSequenceLength(s: string, i: number): number {
+	if (s.charCodeAt(i) !== 0x1b) return 0;
+	const next = s[i + 1];
+	if (next === undefined) return 1;
+	if (next === "[") {
+		let j = i + 2;
+		while (j < s.length) {
+			const c = s.charCodeAt(j);
+			j += 1;
+			if (c >= 0x40 && c <= 0x7e) break;
+		}
+		return j - i;
+	}
+	if (next === "]" || next === "_" || next === "P" || next === "^" || next === "X") {
+		let j = i + 2;
+		while (j < s.length) {
+			if (s[j] === "\x07") return j + 1 - i;
+			if (s[j] === "\x1b" && s[j + 1] === "\\") return j + 2 - i;
+			j += 1;
+		}
+		return s.length - i;
+	}
+	return 2;
+}
+
+/** Drop every escape sequence (CSI/OSC/APC incl. CURSOR_MARKER) from `s`. */
+function stripEscapeSequences(s: string): string {
+	if (!s.includes("\x1b")) return s;
+	let out = "";
+	let i = 0;
+	while (i < s.length) {
+		const n = escapeSequenceLength(s, i);
+		if (n > 0) {
+			i += n;
+			continue;
+		}
+		out += s[i];
+		i += 1;
+	}
+	return out;
+}
+
+/** East Asian Wide / Fullwidth ranges (approximate; wide = 2 cells). */
+function isWideCodePoint(cp: number): boolean {
+	return (
+		(cp >= 0x1100 && cp <= 0x115f) ||
+		(cp >= 0x2e80 && cp <= 0x303e) ||
+		(cp >= 0x3041 && cp <= 0x33ff) ||
+		(cp >= 0x3400 && cp <= 0x4dbf) ||
+		(cp >= 0x4e00 && cp <= 0x9fff) ||
+		(cp >= 0xa000 && cp <= 0xa4cf) ||
+		(cp >= 0xa960 && cp <= 0xa97f) ||
+		(cp >= 0xac00 && cp <= 0xd7a3) ||
+		(cp >= 0xf900 && cp <= 0xfaff) ||
+		(cp >= 0xfe10 && cp <= 0xfe19) ||
+		(cp >= 0xfe30 && cp <= 0xfe6f) ||
+		(cp >= 0xff00 && cp <= 0xff60) ||
+		(cp >= 0xffe0 && cp <= 0xffe6) ||
+		(cp >= 0x16fe0 && cp <= 0x16fe4) ||
+		(cp >= 0x17000 && cp <= 0x18aff) ||
+		(cp >= 0x1b000 && cp <= 0x1b2ff) ||
+		(cp >= 0x1f1e6 && cp <= 0x1f1ff) ||
+		(cp >= 0x1f200 && cp <= 0x1f2ff) ||
+		(cp >= 0x20000 && cp <= 0x2fffd) ||
+		(cp >= 0x30000 && cp <= 0x3fffd)
+	);
+}
+
+/** Terminal cells taken by one grapheme cluster (0, 1 or 2). */
+function graphemeCellWidth(g: string): number {
+	const cp = g.codePointAt(0) ?? 0;
+	if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) return 0;
+	if (/^[\p{M}\p{Cf}\u200b\u2060-\u2064\ufeff]+$/u.test(g)) return 0;
+	if (/\p{Emoji_Presentation}/u.test(g)) return 2;
+	if (g.includes("\ufe0f") && /\p{Extended_Pictographic}/u.test(g)) return 2;
+	return isWideCodePoint(cp) ? 2 : 1;
+}
+
+/** Visible terminal width of `s`: escape sequences stripped, tabs = 3 cells. */
+export function visibleWidth(s: string): number {
+	if (!s) return 0;
+	if (/^[\x20-\x7e]*$/.test(s)) return s.length;
+	let width = 0;
+	for (const g of segmentGraphemes(stripEscapeSequences(s))) {
+		width += g === "\t" ? 3 : graphemeCellWidth(g);
+	}
+	return width;
+}
+
+/**
+ * Cut `text` to at most `maxWidth` cells on a grapheme boundary, keeping
+ * escape sequences before the cut. A truncated result ends with `\x1b[0m`
+ * (then `ellipsis` and another reset when non-empty), matching pi-tui.
+ */
+export function truncateToWidth(text: string, maxWidth: number, ellipsis = "..."): string {
+	if (maxWidth <= 0) return "";
+	if (visibleWidth(text) <= maxWidth) return text;
+	const ellipsisWidth = visibleWidth(ellipsis);
+	if (ellipsis && ellipsisWidth >= maxWidth) return truncateToWidth(ellipsis, maxWidth, "");
+	const target = maxWidth - ellipsisWidth;
+	const finish = (prefix: string): string =>
+		ellipsis ? `${prefix}\x1b[0m${ellipsis}\x1b[0m` : `${prefix}\x1b[0m`;
+	let out = "";
+	let width = 0;
+	let i = 0;
+	while (i < text.length) {
+		const esc = escapeSequenceLength(text, i);
+		if (esc > 0) {
+			out += text.slice(i, i + esc);
+			i += esc;
+			continue;
+		}
+		let end = text.indexOf("\x1b", i);
+		if (end === -1) end = text.length;
+		for (const g of segmentGraphemes(text.slice(i, end))) {
+			const w = g === "\t" ? 3 : graphemeCellWidth(g);
+			if (width + w > target) return finish(out);
+			out += g;
+			width += w;
+		}
+		i = end;
+	}
+	return finish(out);
+}
+
+// ---------------------------------------------------------------------------
 // Ghost overlay rendering (pure; raw ANSI dim — no theme dependency)
 // ---------------------------------------------------------------------------
 
@@ -1845,22 +2344,17 @@ function makeInputHandler(
 		// generation — an in-flight rewrite is invalidated only by a real edit
 		// or a lifecycle reset.
 		if (enhance?.enabled) {
-			if (
-				matchesKey(data, enhance.key as KeyId) ||
-				matchesAcceptKeyRaw(data, enhance.key)
-			) {
+			if (matchesConfiguredKey(data, enhance.key)) {
 				handleEnhanceKey(state, enhance);
 				return { consume: true };
 			}
-			if (data === "\x1b" && enhance.runtime.showing !== "none") {
+			if (matchesKeyId(data, "escape") && enhance.runtime.showing !== "none") {
 				revertEnhance(state, enhance);
 				return { consume: true };
 			}
 		}
 
-		const isAcceptKey =
-			matchesKey(data, state.acceptKey as KeyId) ||
-			matchesAcceptKeyRaw(data, state.acceptKey);
+		const isAcceptKey = matchesConfiguredKey(data, state.acceptKey);
 		const editorTextBefore = state.getEditorText();
 
 		if (
@@ -1887,8 +2381,7 @@ function makeInputHandler(
 		// Carousel: left/right (or Alt+< / Alt+>) while a suggestion is showing
 		// on an empty editor. Wrap within this turn's batch. No extra model call.
 		// Ctrl+P = reverse only (fork patch); elsewhere it stays autocomplete-up.
-		const isCtrlP =
-			data === "\x10" || matchesKey(data, "ctrl+p" as KeyId);
+		const isCtrlP = matchesKeyId(data, "ctrl+p");
 		if (
 			state.suggestion &&
 			state.isIdleGetter() &&
@@ -1904,8 +2397,7 @@ function makeInputHandler(
 		// accept/carousel so a shared key still accepts first while a
 		// suggestion is showing; a distinct key recomputes over it.
 		if (
-			(matchesKey(data, state.suggestKey as KeyId) ||
-				matchesAcceptKeyRaw(data, state.suggestKey)) &&
+			matchesConfiguredKey(data, state.suggestKey) &&
 			state.isIdleGetter() &&
 			editorTextBefore.length === 0
 		) {
@@ -1974,100 +2466,171 @@ export const ENHANCE_SYSTEM_PROMPT = `You rewrite a single instruction to a codi
 // handler; GhostEditor repeats that policy only when OMP bypasses the listener.
 // resetExtensionUI on reload/switch is followed by a fresh session_start that
 // re-installs it (no per-settle re-installation — F-05).
+//
+// The base class is NOT imported by name: OMP >= 19.2 removed `CustomEditor`
+// (and `setEditorComponent`) for its composer hooks, so a named import would
+// fail to link there. It is read at runtime from the coding-agent namespace
+// and the subclass is only defined when the host still exports it.
 
-class GhostEditor extends CustomEditor {
-	private suggestionState: SuggestionState;
-	private enhance: EnhanceController | undefined;
-	constructor(
-		tui: TUI,
-		theme: EditorTheme,
-		keybindings: KeybindingsManager,
-		state: SuggestionState,
-		enhance?: EnhanceController,
-	) {
-		super(tui, theme, keybindings);
-		// Capture the host TUI directly. Pi's CustomEditor sets `this.tui` in
-		// its own constructor; OMP's CustomEditor captures it only via an
-		// `instanceof` probe that can miss depending on module identity —
-		// without it, requestGhostRender silently no-ops and the ghost never
-		// repaints after a re-arm.
-		this.tui = tui;
-		this.suggestionState = state;
-		this.enhance = enhance;
-	}
+/** Structural view of the legacy pi-tui `TUI` handed to editor factories. */
+export interface LegacyTuiLike {
+	requestRender(force?: boolean): void;
+}
 
-	/** Public so the controller can trigger a re-render when the ghost value changes. */
-	requestGhostRender(): void {
-		const paint = (): void => {
-			try {
-				const tui = this.tui;
-				if (!tui || typeof tui.requestRender !== "function") {
-					// Missing TUI is a silent no-op on OMP unless we fall back.
+/** Structural view of a legacy `CustomEditor` instance (Pi / OMP < 19.2). */
+interface CustomEditorInstanceLike {
+	tui?: LegacyTuiLike;
+	render(width: number): readonly string[];
+	handleInput(data: string): void;
+}
+
+/** Structural view of the legacy `CustomEditor` constructor. */
+type CustomEditorCtor = new (
+	tui: LegacyTuiLike,
+	theme: unknown,
+	keybindings: KeybindingsManager,
+) => CustomEditorInstanceLike;
+
+export interface GhostEditorInstance extends CustomEditorInstanceLike {
+	requestGhostRender(): void;
+	render(width: number): string[];
+}
+
+export type GhostEditorClass = new (
+	tui: LegacyTuiLike,
+	theme: unknown,
+	keybindings: KeybindingsManager,
+	state: SuggestionState,
+	enhance?: EnhanceController,
+) => GhostEditorInstance;
+
+function createGhostEditorClass(Base: CustomEditorCtor): GhostEditorClass {
+	return class GhostEditor extends Base {
+		private suggestionState: SuggestionState;
+		private enhance: EnhanceController | undefined;
+		constructor(
+			tui: LegacyTuiLike,
+			theme: unknown,
+			keybindings: KeybindingsManager,
+			state: SuggestionState,
+			enhance?: EnhanceController,
+		) {
+			super(tui, theme, keybindings);
+			// Capture the host TUI directly. Pi's CustomEditor sets `this.tui` in
+			// its own constructor; OMP's CustomEditor captures it only via an
+			// `instanceof` probe that can miss depending on module identity —
+			// without it, requestGhostRender silently no-ops and the ghost never
+			// repaints after a re-arm.
+			this.tui = tui;
+			this.suggestionState = state;
+			this.enhance = enhance;
+		}
+
+		/** Public so the controller can trigger a re-render when the ghost value changes. */
+		requestGhostRender(): void {
+			const paint = (): void => {
+				try {
+					const tui = this.tui;
+					if (!tui || typeof tui.requestRender !== "function") {
+						// Missing TUI is a silent no-op on OMP unless we fall back.
+						this.suggestionState.fallbackToWidget?.();
+						return;
+					}
+					// Ordinary requestRender() coalesces (`if (#renderRequested) return`)
+					// and can be swallowed by the in-flight agent_end frame. Force a
+					// new compose so the overlay is not stuck with empty editor lines.
+					tui.requestRender(true);
+				} catch {
+					// Render pipeline broken -> treat as a ghost failure (P1-1).
 					this.suggestionState.fallbackToWidget?.();
-					return;
 				}
-				// Ordinary requestRender() coalesces (`if (#renderRequested) return`)
-				// and can be swallowed by the in-flight agent_end frame. Force a
-				// new compose so the overlay is not stuck with empty editor lines.
-				tui.requestRender(true);
+			};
+			// Sync first: Pi tests (and Pi itself) expect a thrown requestRender to
+			// fall back immediately. Then one macrotask later for OMP, whose
+			// terminal agent_end fires before the session/TUI fully unwinds.
+			paint();
+			setTimeout(paint, 0);
+		}
+
+		render(width: number): string[] {
+			// `.slice()` normalizes the base render result: Pi returns a mutable
+			// `string[]`, OMP returns `readonly string[]`. The override must return
+			// a mutable array to satisfy both hosts' base signatures.
+			const base = super.render(width).slice();
+			try {
+				// Ghost shows the suggestion plus the accept-key / carousel hint
+				// (mirroring the widget). The hint sits at the END of the ghost, so
+				// width truncation drops the hint first and keeps the suggestion.
+				const suggestion = this.suggestionState.suggestion;
+				const ghostText = suggestion
+					? `${suggestion}  ${formatSuggestionHint(this.suggestionState)}`
+					: suggestion;
+				return overlayGhost(base, ghostText, width);
 			} catch {
-				// Render pipeline broken -> treat as a ghost failure (P1-1).
+				// A ghost overlay failure must never break the editor's own render
+				// pass: surface the base lines and permanently fall back to widget
+				// mode (restoring the previous editor owner).
 				this.suggestionState.fallbackToWidget?.();
+				return base;
 			}
-		};
-		// Sync first: Pi tests (and Pi itself) expect a thrown requestRender to
-		// fall back immediately. Then one macrotask later for OMP, whose
-		// terminal agent_end fires before the session/TUI fully unwinds.
-		paint();
-		setTimeout(paint, 0);
-	}
-
-	render(width: number): string[] {
-		// `.slice()` normalizes the base render result: Pi returns a mutable
-		// `string[]`, OMP returns `readonly string[]`. The override must return
-		// a mutable array to satisfy both hosts' base signatures.
-		const base = super.render(width).slice();
-		try {
-			// Ghost shows the suggestion plus the accept-key / carousel hint
-			// (mirroring the widget). The hint sits at the END of the ghost, so
-			// width truncation drops the hint first and keeps the suggestion.
-			const suggestion = this.suggestionState.suggestion;
-			const ghostText = suggestion
-				? `${suggestion}  ${formatSuggestionHint(this.suggestionState)}`
-				: suggestion;
-			return overlayGhost(base, ghostText, width);
-		} catch {
-			// A ghost overlay failure must never break the editor's own render
-			// pass: surface the base lines and permanently fall back to widget
-			// mode (restoring the previous editor owner).
-			this.suggestionState.fallbackToWidget?.();
-			return base;
 		}
-	}
 
-	handleInput(data: string): void {
-		// OMP normally runs the global listener before the focused editor. If
-		// that listener was bypassed, apply the same accept/dismiss policy here.
-		// A per-dispatch marker prevents duplicate handling when both paths run.
-		const globallyHandled =
-			this.suggestionState.globalInputData === data &&
-			this.suggestionState.globalInputGeneration === this.suggestionState.inputGeneration;
-		this.suggestionState.globalInputData = undefined;
-		this.suggestionState.globalInputGeneration = undefined;
-		if (!globallyHandled) {
-			const result = makeInputHandler(
-				this.suggestionState,
-				this.enhance,
-				false,
-			)?.(data);
-			if (result?.consume) return;
+		handleInput(data: string): void {
+			// OMP normally runs the global listener before the focused editor. If
+			// that listener was bypassed, apply the same accept/dismiss policy here.
+			// A per-dispatch marker prevents duplicate handling when both paths run.
+			const globallyHandled =
+				this.suggestionState.globalInputData === data &&
+				this.suggestionState.globalInputGeneration === this.suggestionState.inputGeneration;
+			this.suggestionState.globalInputData = undefined;
+			this.suggestionState.globalInputGeneration = undefined;
+			if (!globallyHandled) {
+				const result = makeInputHandler(
+					this.suggestionState,
+					this.enhance,
+					false,
+				)?.(data);
+				if (result?.consume) return;
+			}
+			super.handleInput(data);
+			this.tui?.requestRender();
 		}
-		super.handleInput(data);
-		this.tui?.requestRender();
+	};
+}
+
+let ghostEditorClassCache: { base: unknown; cls: GhostEditorClass } | undefined;
+
+/**
+ * The GhostEditor class for this host, or undefined when the host's
+ * coding-agent module no longer exports `CustomEditor` (OMP >= 19.2). Callers
+ * must additionally check `typeof ctx.ui.setEditorComponent === "function"`.
+ * Memoized per base class; never throws.
+ */
+export function getGhostEditorClass(): GhostEditorClass | undefined {
+	let base: unknown;
+	try {
+		// Module namespace: a missing export reads as absent, never throws a link error.
+		const ns: object = hostCodingAgent;
+		base = "CustomEditor" in ns ? ns.CustomEditor : undefined;
+	} catch {
+		return undefined;
+	}
+	if (typeof base !== "function") return undefined;
+	if (ghostEditorClassCache?.base === base) return ghostEditorClassCache.cls;
+	try {
+		const cls = createGhostEditorClass(base as CustomEditorCtor);
+		ghostEditorClassCache = { base, cls };
+		return cls;
+	} catch {
+		return undefined;
 	}
 }
 
-export { GhostEditor };
+/**
+ * GhostEditor on hosts that still export `CustomEditor` (Pi, OMP < 19.2);
+ * undefined on OMP >= 19.2. Kept as an export for tests and embedders.
+ */
+export const GhostEditor: GhostEditorClass | undefined = getGhostEditorClass();
 
 // ---------------------------------------------------------------------------
 // Host compatibility boundary (Pi vs Oh My Pi)
@@ -2159,11 +2722,16 @@ export interface HostCtx extends HostContextLike {
 		): () => void;
 		/** Pi editor-owner getter (absent on OMP). */
 		getEditorComponent?: () => unknown;
+		/**
+		 * Legacy custom-editor installer (Pi, OMP < 19.2). Absent on OMP >= 19.2,
+		 * which replaced it with `ctx.ui.composer` hooks: ghost mode then
+		 * downgrades to widget.
+		 */
 		setEditorComponent?: (
 			factory?:
 				| ((
-						tui: TUI,
-						theme: EditorTheme,
+						tui: LegacyTuiLike,
+						theme: unknown,
 						keybindings: KeybindingsManager,
 				  ) => unknown)
 				| undefined,
@@ -2274,6 +2842,8 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	// Tracks a custom-editor install that OMP must reset itself (it has no
 	// host-side extension-UI teardown like Pi's resetExtensionUI).
 	let editorInstalledForHost = false;
+	// One "ghost unavailable on this host" warning per session (OMP >= 19.2).
+	let ghostUnavailableNotified = false;
 
 	// Boundary: register lifecycle events and the config command through a
 	// structural API view so the host-specific event names typecheck under
@@ -2410,7 +2980,24 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		const wantGhost =
 			(renderMode === "ghost" || renderMode === "both") &&
 			!effective.computeDisabled;
-		if (wantGhost && !editorInstalled) {
+		// Ghost needs the legacy custom-editor API: `setEditorComponent` on the
+		// host UI plus `CustomEditor` from the coding-agent module (Pi, OMP <
+		// 19.2). OMP >= 19.2 has neither (composer hooks replaced them), so
+		// ghost/both run as widget there, with one warning per session.
+		const Ghost =
+			wantGhost && !editorInstalled && typeof ctx.ui.setEditorComponent === "function"
+				? getGhostEditorClass()
+				: undefined;
+		if (wantGhost && !editorInstalled && !Ghost) {
+			state.renderMode = "widget";
+			if (!ghostUnavailableNotified) {
+				ghostUnavailableNotified = true;
+				ctx.ui.notify(
+					`next-prompt: renderMode "${renderMode}" needs the custom-editor API, which this host no longer provides; using widget mode`,
+					"warning",
+				);
+			}
+		} else if (Ghost) {
 			// OMP has no getEditorComponent(): `prior` stays undefined there, so a
 			// fallback restores the DEFAULT editor rather than a captured owner.
 			const prior = ctx.ui.getEditorComponent?.();
@@ -2428,11 +3015,11 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			};
 			state.fallbackToWidget = fallbackToWidget;
 			const ghostFactory = (
-				tui: TUI,
-				theme: EditorTheme,
+				tui: LegacyTuiLike,
+				theme: unknown,
 				kb: KeybindingsManager,
 			) => {
-				const ed = new GhostEditor(tui, theme, kb, state, enhance);
+				const ed = new Ghost(tui, theme, kb, state, enhance);
 				state.renderGhost = () => {
 					try {
 						ed.requestGhostRender();
@@ -2508,6 +3095,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		ref.priorEditorComponent = undefined;
 		ref.installedEditorComponent = undefined;
 		notifiedFallback.value = false;
+		ghostUnavailableNotified = false;
 		editorInstalled = false;
 
 		// F-03: no interactive UI => no invisible suggestion work in headless

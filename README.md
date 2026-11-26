@@ -35,11 +35,13 @@ those needs; a `NONE` result renders nothing. Three render modes:
   editor is unfocused, e.g. after switching tabs/apps)
 - **`both`** — inline ghost AND the below-editor widget simultaneously
 
-> **OMP editor-coexistence note:** `ghost`/`both` work on OMP too. OMP has no
-> public editor-owner getter, so next-prompt cannot detect another custom-editor
-> extension that installed first in the same session — the last installer wins
-> there (Pi captures and can restore the prior owner). If ghost rendering ever
-> fails, the default editor is restored and the mode falls back to widget.
+> **OMP compatibility note:** `widget` works on every host. `ghost`/`both` need
+> the legacy custom-editor API (Pi, OMP < 19.2); OMP 19.2+ replaced it with
+> composer hooks, so there they fall back to `widget` with one warning per
+> session (the extension never imports `pi-tui`, which OMP 19.2+ refuses to load).
+> On older OMP, next-prompt cannot detect another custom-editor extension that
+> installed first (last installer wins); if ghost rendering fails, the default
+> editor is restored and the mode falls back to widget.
 
 Accept with **Enter** (default; configurable) to fill the input box — the first
 press does not send. While a suggestion is showing and the editor is empty,
@@ -238,10 +240,10 @@ comes from the host's `CONFIG_DIR_NAME`:
 | `enabled` | `false` | **Per-session default (opt-in).** Whether a session *starts* with the extension on. A `false` default installs no terminal-input listener or custom editor and makes no background model call until you run `/autosuggest-reply on`; the registered settle handler remains gated to a no-op. The live command overrides this per session. Project config overrides global. Headless/background sessions (including subagents) never compute regardless. |
 | `model` | current model (`ctx.model`) | `{ provider, model }`. If the configured model isn't found, pi notifies once (`warning`) and falls back to the current model. |
 | `thinking` | unset | Reasoning level for the suggestion model: `"minimal"`/`"low"`/`"medium"`/`"high"`/`"xhigh"`/`"max"`. Set `"low"` for faster suggestions. Passed as `reasoning` to the model call. |
-| `acceptKey` | `"enter"` | Any pi-tui `KeyId` (e.g. `"enter"`, `"alt+/"`, `"ctrl+space"`). Intercepted **before** the base editor. Accept only fires when a suggestion is showing and the editor is empty, so the first Enter fills the box and a second Enter submits. |
+| `acceptKey` | `"enter"` | A key id: optional `ctrl`/`alt`/`shift`/`super` modifiers + a named key (`enter`, `escape`, `tab`, `space`, `backspace`, `delete`, `insert`, `home`, `end`, `pageup`, `pagedown`, arrows, `f1`–`f12`) or a single character (e.g. `"enter"`, `"alt+/"`, `"ctrl+space"`). Intercepted **before** the base editor. Accept only fires when a suggestion is showing and the editor is empty, so the first Enter fills the box and a second Enter submits. |
 | `autoSuggest` | `true` | Settled turns auto-compute suggestions. Set `false` for manual-only mode: no model call on settle, only via `suggestKey` or `/autosuggest-reply suggest`. Zero background quota otherwise. |
-| `suggestKey` | `"ctrl+down"` | Any pi-tui `KeyId` that computes one batch on demand. Fires only while idle with an empty editor. `"enter"`/`"tab"` are rejected (submit/autocomplete conflicts). Prefer a non-shift key (see `enhanceKey` note). |
-| `renderMode` | `"widget"` | `"widget"` (below-editor line), `"ghost"` (inline greyed text in the box), or `"both"` (inline ghost + below-editor widget). On OMP, `ghost`/`both` work too (see the editor-coexistence note above). |
+| `suggestKey` | `"ctrl+down"` | A key id (see `acceptKey`) that computes one batch on demand. Fires only while idle with an empty editor. `"enter"`/`"tab"` are rejected (submit/autocomplete conflicts). Prefer a non-shift key (see `enhanceKey` note). |
+| `renderMode` | `"widget"` | `"widget"` (below-editor line), `"ghost"` (inline greyed text in the box), or `"both"` (inline ghost + below-editor widget). `ghost`/`both` fall back to `widget` on OMP 19.2+ (see the compatibility note above). |
 | `rearmDelayMs` | `2000` | Delay (ms) before re-arming the last suggestion after the user deletes back to empty. No new model call. |
 | `systemPrompt` | built-in extractor | Config-file only (not prompted by `/autosuggest-reply configure`). Custom instructions replace the reply-format portion, but the required-reply gate is always appended and overrides conflicts. See `SYSTEM_PROMPT` in `next-prompt.ts`. |
 | `maxTranscriptChars` | `12000` | Tail-truncation of the conversation transcript sent to the model. |
@@ -249,7 +251,7 @@ comes from the host's `CONFIG_DIR_NAME`:
 | `maxSuggestionChars` | `120` | Cap on the returned suggestion length (visible width; a hard code-point bound of 4× this value also applies, so zero-width payloads cannot bypass the cap). |
 | `allowCrossProvider` | `false` | Global cross-destination opt-in. When `true`, the configured suggestion model may receive text even when its provider, endpoint, or model route differs from the active model; no per-project consent dialog appears. When `false`, the extension silently falls back to the active model. Project config can never loosen a global `false`. |
 | `enhanceEnabled` | `true` | Enables the enhance-prompt keybinding (rewrite the typed prompt in place). Fires on a non-empty editor even while the agent is active; sends only the typed text, never the transcript. Disabled automatically when a privacy-invalid config fails closed. |
-| `enhanceKey` | `"ctrl+up"` | Any pi-tui `KeyId` that enhances the current editor text. Same key (or Esc) reverts to the original; editing commits. Must differ from `acceptKey`; `"enter"`/`"tab"` are rejected. Prefer a non-shift key — a shift-bearing symbol like `alt+?` cannot match under terminals' enhanced keyboard protocols (xterm modifyOtherKeys / kitty). |
+| `enhanceKey` | `"ctrl+up"` | A key id (see `acceptKey`) that enhances the current editor text. Same key (or Esc) reverts to the original; editing commits. Must differ from `acceptKey`; `"enter"`/`"tab"` are rejected. Prefer a non-shift key — a shift-bearing symbol like `alt+?` cannot match under terminals' enhanced keyboard protocols (xterm modifyOtherKeys / kitty). |
 | `enhanceSystemPrompt` | built-in | Config-file only (not prompted by `/autosuggest-reply configure`). Overrides the enhance instruction; see `ENHANCE_SYSTEM_PROMPT` in `next-prompt.ts`. |
 
 ### Why `enter` is the default accept key
